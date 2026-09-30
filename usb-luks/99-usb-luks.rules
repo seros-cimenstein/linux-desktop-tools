@@ -1,0 +1,12 @@
+# usb-luks: offer encryption / auto-unlock for USB storage. Policy lives in /usr/local/sbin/usb-luks.
+ACTION!="add|change", GOTO="usb_luks_end"
+SUBSYSTEM!="block", GOTO="usb_luks_end"
+ENV{ID_BUS}!="usb", GOTO="usb_luks_end"
+# partitions with a filesystem or LUKS header, once when they appear
+ENV{DEVTYPE}=="partition", ACTION=="add", ENV{ID_FS_TYPE}=="?*", GOTO="usb_luks_run"
+# unpartitioned drives (filesystem on the whole disk, or blank); "change" = media inserted in a reader
+ENV{DEVTYPE}=="disk", ENV{ID_PART_TABLE_TYPE}=="", GOTO="usb_luks_run"
+GOTO="usb_luks_end"
+LABEL="usb_luks_run"
+RUN+="/usr/bin/systemctl --no-block start usb-luks@%k.service"
+LABEL="usb_luks_end"

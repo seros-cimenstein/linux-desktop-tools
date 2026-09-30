@@ -1,0 +1,9 @@
+[Unit]
+Description=USB drive encryption prompt for /dev/%i
+Documentation=file:/usr/local/sbin/usb-luks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/usb-luks handle %i
+# Encryption rewrites the whole drive and waits for the user; never time out.
+TimeoutStartSec=infinity

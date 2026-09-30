@@ -1,0 +1,683 @@
+#!/usr/bin/env bash
+# usb-luks: offer LUKS2 encryption for USB drives when they are plugged in, keeping
+# their data, and auto-unlock drives it encrypted.
+#
+#   usb-luks handle KNAME        udev/systemd entry point (root): prompt, encrypt, unlock
+#   usb-luks check KNAME         explain whether KNAME would be offered (any user)
+#   usb-luks encrypt DEV OWNER   encrypt or resume DEV without GUI; passphrase on stdin (root)
+#
+# Never touched: devices on USB ports the firmware marks "fixed" (built into this PC),
+# anything that is not pure USB mass storage (phones, cameras, media players), drives on
+# /etc/usb-luks/ignore, read-only media, EFI boot partitions, and mounted system paths.
+#
+# Methods, all keeping data:
+#   ext2/3/4, btrfs   shrink the filesystem 32 MiB, `cryptsetup reencrypt --encrypt` in place
+#                     (resumable: replug and enter the passphrase)
+#   vfat/exfat/ntfs   copy files to /var/lib/usb-luks/staging, verify by checksum, LUKS2 +
+#                     ext4, copy back, verify, delete the copy (resumable: replug)
+#   blank drive       GPT + one LUKS2/ext4 partition
+# Every drive gets the chosen passphrase plus a random keyfile at
+# ~OWNER/.local/share/usb-luks/keys/<LUKS-UUID>.key, used to unlock through udisks.
+set -euo pipefail
+shopt -s nullglob
+trap '' PIPE # a closed progress window must never kill a running operation
+
+readonly IGNORE_FILE=/etc/usb-luks/ignore
+readonly STATE_DIR=/run/usb-luks
+readonly STAGE_ROOT=/var/lib/usb-luks/staging
+readonly HEADER_ROOM=$((32 * 1024 * 1024)) # 2x default LUKS2 header, per cryptsetup-reencrypt(8)
+readonly STAGE_MARGIN=$((1024 * 1024 * 1024))
+readonly ESP_TYPES=" c12a7328-f81f-11d2-ba4b-00a0c93ec93b 0xef "
+
+declare -A P=()                                   # udev/blkid properties of the device
+PASS=""                                           # drive passphrase
+OWNER="" OWNER_UID="" OWNER_GID="" OWNER_HOME="" KEY_DIR=""
+GUI=0 SESSION_ENV=() PROG_FD="" PROG_PID=""
+MOUNTS=() MAPS=()
+KIND="" LABEL="" REASON="" FAIL_MSG="" WORK_DEV="" ENC_DEV=""
+DRIVE_STATE=unchanged # unchanged | reencrypt | staged:<dir> | encrypted
+
+log() { printf 'usb-luks: %s\n' "$*" >&2; }
+die() {
+	FAIL_MSG=$*
+	log "error: $*"
+	exit 1
+}
+
+# ---------------------------------------------------------------- device facts
+
+load_props() { # dev
+	local key val
+	P=()
+	while IFS='=' read -r key val; do P[$key]=$val; done < <(udevadm info -q property -n "$1" 2>/dev/null || true)
+	if ((EUID == 0)); then # udev's copy can be stale right after changes; probe the device
+		for key in ID_FS_TYPE ID_FS_UUID ID_FS_LABEL_ENC ID_PART_TABLE_TYPE ID_PART_ENTRY_TYPE; do unset "P[$key]"; done
+		while IFS='=' read -r key val; do P[$key]=$val; done < <(blkid -p -o udev "$1" 2>/dev/null || true)
+	fi
+}
+
+parent_disk() { # kname
+	local p
+	p=$(realpath "/sys/class/block/$1")
+	if [[ -e $p/partition ]]; then basename "${p%/*}"; else basename "$p"; fi
+}
+
+usb_device_syspath() { # disk kname
+	local p
+	p=$(realpath "/sys/class/block/$1")
+	while [[ $p == /sys/* && ! -f $p/idVendor ]]; do p=${p%/*}; done
+	[[ -f $p/idVendor ]] || return 1
+	printf '%s\n' "$p"
+}
+
+check_eligible() { # kname; sets REASON on refusal
+	local k=$1 disk usbp mp
+	disk=$(parent_disk "$k")
+	[[ ${P[ID_BUS]:-} == usb ]] || { REASON="not a USB device"; return 1; }
+	# Pure mass storage only (class 08 on every interface). Phones expose MTP/PTP.
+	[[ ${P[ID_USB_INTERFACES]:-} =~ ^(:08[0-9a-f]{4})+:$ ]] ||
+		{ REASON="not plain USB storage (interfaces ${P[ID_USB_INTERFACES]:-?}): phone, camera or multi-function device"; return 1; }
+	usbp=$(usb_device_syspath "$disk") || { REASON="no USB parent device"; return 1; }
+	[[ $(<"$usbp/removable") != fixed ]] || { REASON="built into this PC (USB port marked fixed)"; return 1; }
+	if grep -qE '^(ID_MTP_DEVICE|ID_GPHOTO2?|ID_MEDIA_PLAYER)=' <<<"$(udevadm info -q property -p "$usbp")"; then
+		REASON="phone, camera or media player"
+		return 1
+	fi
+	if [[ -n ${P[ID_SERIAL]:-} && -f $IGNORE_FILE ]] && grep -qxF -- "${P[ID_SERIAL]}" "$IGNORE_FILE"; then
+		REASON="on $IGNORE_FILE"
+		return 1
+	fi
+	[[ $(<"/sys/class/block/$k/ro") == 0 ]] || { REASON="read-only"; return 1; }
+	(($(<"/sys/class/block/$k/size") > 0)) || { REASON="no media"; return 1; }
+	while IFS= read -r mp; do
+		case $mp in /run/media/* | /media/* | /mnt/*) ;; *) REASON="mounted at $mp"; return 1 ;; esac
+	done < <(findmnt -ln -o TARGET -S "/dev/$k" || true)
+}
+
+detect_kind() { # dev; sets KIND, LABEL; REASON on refusal
+	local fs=${P[ID_FS_TYPE]:-} sig holders
+	LABEL=$(printf '%b' "${P[ID_FS_LABEL_ENC]:-}")
+	LABEL=${LABEL:-USB}
+	case "$ESP_TYPES" in *" ${P[ID_PART_ENTRY_TYPE]:-none} "*) REASON="EFI system partition (boot media)"; return 1 ;; esac
+	case $fs in
+	crypto_LUKS) KIND=luks ;;
+	ext2 | ext3 | ext4) KIND=inplace-ext ;;
+	btrfs) KIND=inplace-btrfs ;;
+	vfat | exfat | ntfs) KIND=copyback ;;
+	"")
+		if [[ ${P[DEVTYPE]:-} == disk && -z ${P[ID_PART_TABLE_TYPE]:-} ]] &&
+			sig=$(wipefs --noheadings "$1" 2>/dev/null) && [[ -z $sig ]]; then
+			KIND=blank
+		elif [[ -n ${P[ID_PART_TABLE_TYPE]:-} ]]; then
+			REASON="partitioned disk; its partitions are handled individually"
+			return 1
+		else
+			REASON="no filesystem found"
+			return 1
+		fi
+		;;
+	*) REASON="filesystem '$fs' is not supported"; return 1 ;;
+	esac
+	holders=(/sys/class/block/"${1##*/}"/holders/*)
+	if [[ $KIND != luks && ${#holders[@]} -gt 0 ]]; then
+		REASON="in use by RAID/LVM/device-mapper"
+		return 1
+	fi
+}
+
+drive_name() {
+	local n
+	n=$(printf '%b %b' "${P[ID_VENDOR_ENC]:-}" "${P[ID_MODEL_ENC]:-}" | tr -s ' ')
+	n=${n# }
+	printf '%s\n' "${n% }"
+}
+
+crypt_child() { lsblk -nrpo NAME,TYPE "$1" | awk '$2 == "crypt" { print $1 }'; }
+
+# ------------------------------------------------------------ session and GUI
+
+set_owner() { # user
+	local ent
+	ent=$(getent passwd "$1") || die "unknown user $1"
+	IFS=: read -r OWNER _ OWNER_UID OWNER_GID _ OWNER_HOME _ <<<"$ent"
+	KEY_DIR=${USB_LUKS_KEY_DIR:-$OWNER_HOME/.local/share/usb-luks/keys}
+}
+
+find_session() { # active graphical session on seat0 -> owner + its environment
+	local sid line
+	while read -r sid _; do
+		[[ $(loginctl show-session "$sid" -p Active --value) == yes ]] || continue
+		[[ $(loginctl show-session "$sid" -p Seat --value) == seat0 ]] || continue
+		case $(loginctl show-session "$sid" -p Type --value) in wayland | x11) ;; *) continue ;; esac
+		set_owner "$(loginctl show-session "$sid" -p Name --value)"
+		SESSION_ENV=("XDG_RUNTIME_DIR=/run/user/$OWNER_UID" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$OWNER_UID/bus")
+		while IFS= read -r line; do
+			case $line in WAYLAND_DISPLAY=* | DISPLAY=* | XAUTHORITY=* | XDG_CURRENT_DESKTOP=* | XDG_SESSION_TYPE=*) SESSION_ENV+=("$line") ;; esac
+		done < <(systemctl --user --machine="$OWNER@.host" show-environment 2>/dev/null || true)
+		return 0
+	done < <(loginctl list-sessions --no-legend)
+	return 1
+}
+
+as_user() { runuser -u "$OWNER" -- env "${SESSION_ENV[@]}" "$@"; }
+# udisks calls go through the user's systemd manager: runuser opens a separate, inactive
+# logind session, and polkit only lets the active session unlock/mount without a password.
+as_user_manager() { systemd-run --user --machine="$OWNER@.host" --wait --pipe --quiet "$@"; }
+
+notify() { as_user notify-send -a "USB encryption" -i drive-removable-media "$@" 2>/dev/null || true; }
+
+ask_encrypt() { # text; 0 = encrypt, 1 = not now, 2 = never for this drive
+	local out rc=0
+	out=$(as_user zenity --question --no-markup --width=460 --title="Encrypt USB drive?" --text="$1" \
+		--ok-label="Encrypt" --cancel-label="Not now" --extra-button="Never for this drive") || rc=$?
+	((rc == 0)) && return 0
+	[[ $out == "Never for this drive" ]] && return 2
+	return 1
+}
+
+ask_new_passphrase() {
+	local out p1 p2 sep=$'\x1f'
+	while :; do
+		out=$(as_user zenity --forms --width=420 --title="Drive passphrase" --separator="$sep" \
+			--text="This passphrase opens the drive on any Linux computer. On this PC the drive unlocks automatically." \
+			--add-password="Passphrase" --add-password="Repeat passphrase") || return 1
+		p1=${out%%"$sep"*}
+		p2=${out#*"$sep"}
+		if [[ -n $p1 && $p1 == "$p2" ]]; then
+			PASS=$p1
+			return 0
+		fi
+		as_user zenity --warning --no-markup --text="The passphrases are empty or do not match. Try again." || true
+	done
+}
+
+ask_existing_passphrase() { # dev text
+	local _
+	for _ in 1 2 3; do
+		PASS=$(as_user zenity --forms --width=420 --title="Drive passphrase" --text="$2" --add-password="Passphrase") || return 1
+		if printf '%s' "$PASS" | cryptsetup open --test-passphrase --key-file=- "$1" 2>/dev/null; then return 0; fi
+		as_user zenity --warning --no-markup --text="Wrong passphrase." || true
+	done
+	return 1
+}
+
+progress_open() { # title
+	((GUI)) || return 0
+	local fifo
+	fifo=$(mktemp -u "$STATE_DIR/progress.XXXXXX")
+	mkfifo -m 600 "$fifo"
+	as_user zenity --progress --width=460 --title="$1" --text="Starting…" --percentage=0 --auto-close --no-cancel <"$fifo" &
+	PROG_PID=$!
+	exec {PROG_FD}>"$fifo"
+	rm -f "$fifo"
+}
+
+progress_close() {
+	[[ -n $PROG_FD ]] || return 0
+	printf '100\n' 1>&"$PROG_FD" 2>/dev/null || true
+	exec {PROG_FD}>&-
+	PROG_FD=""
+	wait "$PROG_PID" 2>/dev/null || true
+}
+
+say() {
+	log "$*"
+	if [[ -n $PROG_FD ]]; then printf '# %s\n' "$*" 1>&"$PROG_FD" 2>/dev/null || true; fi
+}
+
+pct() { # percent; 100 is reserved for progress_close (it closes the window)
+	if [[ -n $PROG_FD ]]; then printf '%d\n' "$(($1 > 99 ? 99 : $1))" 1>&"$PROG_FD" 2>/dev/null || true; fi
+}
+
+cryptsetup_progress() { # reads `cryptsetup --progress-json` lines
+	local line
+	while IFS= read -r line; do
+		if [[ $line =~ \"device_bytes\":\"([0-9]+)\".*\"device_size\":\"([0-9]+)\" ]] && ((BASH_REMATCH[2] > 0)); then
+			pct $((BASH_REMATCH[1] * 100 / BASH_REMATCH[2]))
+		fi
+	done
+}
+
+rsync_progress() { # reads `rsync --info=progress2` output
+	local tok
+	while IFS= read -r -d $'\r' tok; do
+		if [[ $tok =~ ([0-9]+)% ]]; then pct "${BASH_REMATCH[1]}"; fi
+	done
+}
+
+# -------------------------------------------------------- mounts and mappings
+
+tmp_mount() { # dev [options] -> REPLY = mountpoint
+	local dir opts=()
+	if [[ -n ${2:-} ]]; then opts=(-o "$2"); fi
+	dir=$(mktemp -d "$STATE_DIR/mnt.XXXXXX")
+	mount "${opts[@]}" "$1" "$dir" || { rmdir "$dir"; die "could not mount $1"; }
+	MOUNTS+=("$dir")
+	REPLY=$dir
+}
+
+tmp_umount() { # mountpoint
+	local m keep=()
+	umount "$1"
+	rmdir "$1"
+	for m in "${MOUNTS[@]}"; do [[ $m == "$1" ]] || keep+=("$m"); done
+	MOUNTS=("${keep[@]}")
+}
+
+open_luks() { # luks dev -> REPLY = /dev/mapper/..., using this PC's keyfile
+	local name="usb-luks-${1##*/}"
+	cryptsetup open --key-file "$KEY_DIR/$(cryptsetup luksUUID "$1").key" "$1" "$name"
+	MAPS+=("$name")
+	REPLY=/dev/mapper/$name
+}
+
+close_luks() { # /dev/mapper/name
+	local m keep=()
+	cryptsetup close "${1##*/}"
+	for m in "${MAPS[@]}"; do [[ $m == "${1##*/}" ]] || keep+=("$m"); done
+	MAPS=("${keep[@]}")
+}
+
+ensure_unmounted() { # dev
+	if findmnt -S "$1" >/dev/null; then
+		umount -A "$1" || die "the drive is busy; close files on it and plug it in again"
+	fi
+}
+
+on_exit() {
+	local rc=$? i msg
+	for ((i = ${#MOUNTS[@]} - 1; i >= 0; i--)); do
+		umount "${MOUNTS[i]}" 2>/dev/null || umount -l "${MOUNTS[i]}" 2>/dev/null || true
+		rmdir "${MOUNTS[i]}" 2>/dev/null || true
+	done
+	for ((i = ${#MAPS[@]} - 1; i >= 0; i--)); do cryptsetup close "${MAPS[i]}" 2>/dev/null || true; done
+	progress_close
+	((rc != 0 && GUI)) || return 0
+	if [[ $DRIVE_STATE == reencrypt && -n $WORK_DEV ]] && ! cryptsetup isLuks "$WORK_DEV" 2>/dev/null; then
+		DRIVE_STATE=unchanged # failed before cryptsetup touched the data
+	fi
+	msg="${FAIL_MSG:-unexpected error; see: journalctl -u 'usb-luks@*'}"$'\n\n'
+	case $DRIVE_STATE in
+	unchanged) msg+="Your files on the drive were not changed." ;;
+	reencrypt) msg+="Encryption stopped part-way. Your files are intact. Plug the drive in again and enter the passphrase to resume. Do not format it." ;;
+	staged:*) msg+="A verified copy of your files is kept at ${DRIVE_STATE#staged:} (root only). Plug the drive in again to retry copying them back." ;;
+	encrypted) msg+="The drive is encrypted and your files are on it; only the last step failed." ;;
+	esac
+	as_user zenity --error --no-markup --width=460 --title="USB encryption" --text="$msg" || true
+}
+
+# ---------------------------------------------------------------- operations
+
+luks_format() { # dev label
+	printf '%s' "$PASS" | cryptsetup luksFormat --type luks2 --batch-mode --key-file=- --label "$2" "$1"
+}
+
+add_keyfile() { # luks dev; key readable by OWNER so udisks can unlock as that user
+	local key
+	key=$KEY_DIR/$(cryptsetup luksUUID "$1").key
+	runuser -u "$OWNER" -- mkdir -p "$KEY_DIR"
+	chmod 700 "$KEY_DIR"
+	(umask 077 && head -c 64 /dev/urandom >"$key.tmp")
+	chown "$OWNER_UID:$OWNER_GID" "$key.tmp"
+	printf '%s' "$PASS" | cryptsetup luksAddKey --batch-mode --key-file=- "$1" "$key.tmp"
+	mv "$key.tmp" "$key"
+}
+
+keyfile_works() { # luks dev
+	local key
+	key=$KEY_DIR/$(cryptsetup luksUUID "$1").key
+	[[ -f $key ]] && cryptsetup open --test-passphrase --key-file "$key" "$1" 2>/dev/null
+}
+
+verify_copy() { # src dst: every file in src exists in dst with identical content
+	local diff
+	diff=$(rsync -rlcn --out-format='%n' "$1/" "$2/") || die "could not read all files while verifying the copy"
+	if [[ -n $diff ]]; then
+		log "files that differ after copying:"$'\n'"$diff"
+		die "copied files do not match the originals"
+	fi
+}
+
+shrink_ext() { # dev
+	local rc=0 bs count target
+	say "Checking the filesystem…"
+	e2fsck -f -p "$1" >&2 || rc=$?
+	((rc < 4)) || die "the filesystem has errors that need manual repair (run: e2fsck -f $1)"
+	bs=$(dumpe2fs -h "$1" 2>/dev/null | sed -n 's/^Block size: *//p')
+	count=$(dumpe2fs -h "$1" 2>/dev/null | sed -n 's/^Block count: *//p')
+	target=$((($(blockdev --getsize64 "$1") - HEADER_ROOM) / bs))
+	if ((count > target)); then
+		say "Making 32 MB of room for the encryption header…"
+		resize2fs "$1" "$target" >&2 || die "could not shrink the filesystem; free at least 32 MB on the drive and try again"
+	fi
+}
+
+shrink_btrfs() { # dev
+	local out mnt
+	out=$(btrfs filesystem show "$1")
+	[[ $out == *"Total devices 1 "* ]] || die "btrfs spanning several devices is not supported"
+	say "Making 32 MB of room for the encryption header…"
+	tmp_mount "$1"
+	mnt=$REPLY
+	btrfs filesystem resize "-$((HEADER_ROOM / 1048576 + 1))m" "$mnt" >&2 || die "could not shrink the filesystem; free at least 32 MB on the drive and try again"
+	tmp_umount "$mnt"
+}
+
+reencrypt_encrypt() { # dev label
+	say "Encrypting in place. Do not unplug the drive."
+	pct 0
+	DRIVE_STATE=reencrypt
+	printf '%s' "$PASS" | cryptsetup reencrypt --encrypt --type luks2 --reduce-device-size "$HEADER_ROOM" \
+		--batch-mode --key-file=- --label "$2" --progress-json "$1" | cryptsetup_progress
+}
+
+reencrypt_resume() { # dev
+	say "Resuming encryption. Do not unplug the drive."
+	pct 0
+	DRIVE_STATE=reencrypt
+	printf '%s' "$PASS" | cryptsetup reencrypt --resume-only --batch-mode --key-file=- --progress-json "$1" | cryptsetup_progress
+}
+
+reencrypt_pending() { # dev
+	local dump
+	dump=$(cryptsetup luksDump "$1" 2>/dev/null) || return 1
+	[[ $dump == *online-reencrypt* ]]
+}
+
+finish_inplace() { # luks dev: key for this PC, grow the filesystem back over the freed space
+	local map fstype rc=0 mnt
+	DRIVE_STATE=encrypted
+	say "Adding this PC's key…"
+	add_keyfile "$1"
+	open_luks "$1"
+	map=$REPLY
+	fstype=$(blkid -o value -s TYPE "$map" || true)
+	say "Growing the filesystem to full size…"
+	case $fstype in
+	ext2 | ext3 | ext4)
+		e2fsck -f -p "$map" >&2 || rc=$?
+		((rc < 4)) || die "filesystem check failed after encryption (run: e2fsck -f $map)"
+		resize2fs "$map" >&2
+		;;
+	btrfs)
+		tmp_mount "$map"
+		mnt=$REPLY
+		btrfs filesystem resize max "$mnt" >&2
+		tmp_umount "$mnt"
+		;;
+	esac
+	close_luks "$map"
+}
+
+pending_stage() { # luks uuid -> REPLY = staging dir holding this drive's files
+	local meta
+	for meta in "$STAGE_ROOT"/*/meta; do
+		if grep -qx "luks_uuid=$1" "$meta"; then
+			REPLY=${meta%/meta}
+			return 0
+		fi
+	done
+	return 1
+}
+
+restore_stage() { # luks dev, staging dir
+	local map mnt fstype
+	DRIVE_STATE=staged:$2
+	open_luks "$1"
+	map=$REPLY
+	fstype=$(blkid -o value -s TYPE "$map" || true)
+	if [[ -z $fstype ]]; then # fresh volume, or interrupted before mkfs last time
+		mkfs.ext4 -q -L "$(sed -n 's/^label=//p' "$2/meta" | cut -c1-16)" "$map"
+	fi
+	tmp_mount "$map"
+	mnt=$REPLY
+	say "Copying files back to the encrypted drive…"
+	pct 0
+	rsync -rlt --info=progress2 --no-inc-recursive "$2/data/" "$mnt/" | rsync_progress
+	say "Verifying the files on the drive…"
+	verify_copy "$2/data" "$mnt"
+	find "$mnt" -path "$mnt/lost+found" -prune -o -exec chown -h "$OWNER_UID:$OWNER_GID" {} +
+	tmp_umount "$mnt"
+	close_luks "$map"
+	rm -rf "$2"
+	DRIVE_STATE=encrypted
+}
+
+copyback_encrypt() { # dev label fstype
+	local src used avail stage
+	say "Reading the drive…"
+	if [[ $3 == vfat ]]; then tmp_mount "$1" ro,utf8; else tmp_mount "$1" ro; fi # keep non-ASCII names intact
+	src=$REPLY
+	used=$(df -B1 --output=used "$src" | sed 1d | tr -d ' ')
+	install -d -m 700 "$STAGE_ROOT"
+	avail=$(df -B1 --output=avail "$STAGE_ROOT" | sed 1d | tr -d ' ')
+	((used + STAGE_MARGIN <= avail)) ||
+		die "not enough free space on this PC for a temporary copy ($((used / 1048576)) MB plus 1 GB margin needed)"
+	stage=$STAGE_ROOT/$(date +%Y%m%d-%H%M%S)-${1##*/}
+	install -d -m 700 "$stage/data"
+	printf 'device=%s\nserial=%s\nlabel=%s\nfstype=%s\n' "$1" "${P[ID_SERIAL]:-}" "$2" "$3" >"$stage/meta"
+	say "Copying files to this PC…"
+	pct 0
+	rsync -rlt --chmod=D0755,F0644 --info=progress2 --no-inc-recursive "$src/" "$stage/data/" | rsync_progress
+	say "Verifying the copy…"
+	verify_copy "$src" "$stage/data"
+	tmp_umount "$src"
+
+	DRIVE_STATE=staged:$stage # from here on the files live only in $stage until restored
+	say "Creating the encrypted volume…"
+	wipefs -a -q "$1"
+	luks_format "$1" "$2"
+	printf 'luks_uuid=%s\n' "$(cryptsetup luksUUID "$1")" >>"$stage/meta"
+	add_keyfile "$1"
+	restore_stage "$1" "$stage"
+}
+
+format_blank() { # disk label
+	local part map mnt
+	say "Creating a partition…"
+	printf 'label: gpt\n,,L\n' | sfdisk --quiet --wipe always "$1" >&2
+	udevadm settle
+	part=$(lsblk -nrpo NAME,TYPE "$1" | awk '$2 == "part" && !f { print $1; f = 1 }')
+	[[ -b $part ]] || die "the new partition did not appear"
+	say "Creating the encrypted volume…"
+	luks_format "$part" "$2"
+	add_keyfile "$part"
+	open_luks "$part"
+	map=$REPLY
+	mkfs.ext4 -q -L "${2:0:16}" "$map"
+	tmp_mount "$map"
+	mnt=$REPLY
+	chown "$OWNER_UID:$OWNER_GID" "$mnt"
+	tmp_umount "$mnt"
+	close_luks "$map"
+	DRIVE_STATE=encrypted
+	ENC_DEV=$part
+}
+
+encrypt_device() { # dev; needs KIND, LABEL, PASS, owner
+	WORK_DEV=$1
+	ENC_DEV=$1
+	ensure_unmounted "$1"
+	case $KIND in
+	inplace-ext | inplace-btrfs)
+		if [[ $KIND == inplace-ext ]]; then shrink_ext "$1"; else shrink_btrfs "$1"; fi
+		reencrypt_encrypt "$1" "$LABEL"
+		finish_inplace "$1"
+		;;
+	copyback) copyback_encrypt "$1" "$LABEL" "${P[ID_FS_TYPE]}" ;;
+	blank) format_blank "$1" "$LABEL" ;;
+	*) die "nothing to do for $KIND" ;;
+	esac
+}
+
+luks_pending() { # luks dev -> REPLY = reencrypt | stage:<dir> | ""
+	REPLY=""
+	if reencrypt_pending "$1"; then
+		REPLY=reencrypt
+	elif pending_stage "$(cryptsetup luksUUID "$1")"; then
+		REPLY=stage:$REPLY
+	fi
+}
+
+resume_luks() { # luks dev, pending (from luks_pending); PASS set when the keyfile cannot be used
+	WORK_DEV=$1
+	ENC_DEV=$1
+	ensure_unmounted "$1"
+	case $2 in
+	reencrypt)
+		reencrypt_resume "$1"
+		finish_inplace "$1"
+		;;
+	stage:*)
+		if ! keyfile_works "$1"; then add_keyfile "$1"; fi
+		restore_stage "$1" "${2#stage:}"
+		;;
+	esac
+}
+
+unlock_and_mount() { # luks dev: unlock and mount as the session user via udisks
+	local key clear mp
+	key=$KEY_DIR/$(cryptsetup luksUUID "$1").key
+	if [[ ! -f $key ]]; then
+		log "no key for $1 on this PC; leaving it locked"
+		return 0
+	fi
+	clear=$(crypt_child "$1")
+	if [[ -z $clear ]]; then
+		as_user_manager udisksctl unlock --no-user-interaction -b "$1" --key-file "$key" >&2 || return 1
+		udevadm settle
+		clear=$(crypt_child "$1")
+		[[ -n $clear ]] || return 1
+	fi
+	if ! findmnt -S "$clear" >/dev/null; then
+		# a desktop auto-mounter may win the race after unlock; mounted either way is success
+		as_user_manager udisksctl mount --no-user-interaction -b "$clear" >&2 || findmnt -S "$clear" >/dev/null || return 1
+	fi
+	mp=$(findmnt -ln -o TARGET -S "$clear" | sed -n 1p)
+	notify "Encrypted drive unlocked" "$(drive_name) is mounted at $mp"
+}
+
+describe() { # dev -> prompt text
+	local size how
+	size=$(lsblk -dno SIZE "$1" | tr -d ' ')
+	case $KIND in
+	inplace-*) how="The drive is encrypted in place and your files stay on it. The whole partition is rewritten, which can take a while. Don't unplug it until it's done. If it gets interrupted, plug it back in to resume." ;;
+	copyback) how="${P[ID_FS_TYPE]} can't be encrypted in place. Your files are copied to this PC and checked, then the partition is recreated as encrypted ext4, and the files are copied back and checked again. The temporary copy is then deleted." ;;
+	blank) how="No filesystem was found. The drive gets one encrypted ext4 partition, and anything on it that wasn't recognised is erased." ;;
+	esac
+	printf '%s (%s)\n%s: %s "%s"\n\n%s\n\nAfterwards it opens only on Linux.' \
+		"$(drive_name)" "$size" "$1" "${P[ID_FS_TYPE]:-empty}" "$LABEL" "$how"
+}
+
+# ------------------------------------------------------------------ commands
+
+cmd_handle() { # kname
+	local k=$1 dev=/dev/$1 disk seq choice=0 uuid_before
+	[[ -b $dev ]] || exit 0
+	install -d -m 700 "$STATE_DIR"
+	disk=$(parent_disk "$k")
+	exec {LOCK_FD}>"$STATE_DIR/lock.$disk"
+	flock "$LOCK_FD"
+	seq=$(<"/sys/class/block/$disk/diskseq")
+	[[ ! -e $STATE_DIR/seen.$seq.$k ]] || exit 0 # once per plug-in
+	: >"$STATE_DIR/seen.$seq.$k"
+
+	load_props "$dev"
+	if ! check_eligible "$k" || ! detect_kind "$dev"; then
+		log "skipping $dev: $REASON"
+		exit 0
+	fi
+	find_session || { log "no active graphical session; skipping $dev"; exit 0; }
+	GUI=1
+	trap on_exit EXIT
+
+	if [[ $KIND == luks ]]; then
+		luks_pending "$dev"
+		local pending=$REPLY
+		case $pending in
+		reencrypt) ask_existing_passphrase "$dev" "Encrypting $(drive_name) was interrupted. Enter its passphrase to continue." || exit 0 ;;
+		stage:*) if ! keyfile_works "$dev"; then ask_existing_passphrase "$dev" "Copying files back to $(drive_name) was interrupted. Enter its passphrase to continue." || exit 0; fi ;;
+		esac
+		if [[ -n $pending ]]; then
+			progress_open "Finishing encryption of $(drive_name)"
+			resume_luks "$dev" "$pending"
+			progress_close
+		fi
+		unlock_and_mount "$dev" || die "could not unlock $(drive_name)"
+		return 0
+	fi
+
+	ask_encrypt "$(describe "$dev")" || choice=$?
+	case $choice in
+	0) ;;
+	2)
+		if [[ -n ${P[ID_SERIAL]:-} ]]; then
+			install -d -m 755 "${IGNORE_FILE%/*}"
+			printf '%s\n' "${P[ID_SERIAL]}" >>"$IGNORE_FILE"
+			notify "USB encryption" "Won't ask again for $(drive_name)"
+		fi
+		return 0
+		;;
+	*) return 0 ;;
+	esac
+	ask_new_passphrase || return 0
+
+	# The dialogs can stay open a long time: make sure it is still the same drive.
+	uuid_before=${P[ID_FS_UUID]:-}
+	[[ -b $dev && $(<"/sys/class/block/$disk/diskseq") == "$seq" ]] || die "the drive was removed"
+	load_props "$dev"
+	local kind_before=$KIND
+	detect_kind "$dev" || die "the drive changed: $REASON"
+	[[ $KIND == "$kind_before" && ${P[ID_FS_UUID]:-} == "$uuid_before" ]] || die "the drive changed while waiting"
+
+	progress_open "Encrypting $(drive_name)"
+	encrypt_device "$dev"
+	progress_close
+	unlock_and_mount "$ENC_DEV" || die "encrypted, but unlocking it failed"
+	notify "USB drive encrypted" "$(drive_name) now needs its passphrase on other computers."
+}
+
+cmd_check() { # kname
+	local k=${1#/dev/}
+	[[ -b /dev/$k ]] || die "/dev/$k is not a block device"
+	load_props "/dev/$k"
+	if check_eligible "$k" && detect_kind "/dev/$k"; then
+		printf '/dev/%s: would handle (%s)\n' "$k" "$KIND"
+	else
+		printf '/dev/%s: skipped: %s\n' "$k" "$REASON"
+	fi
+}
+
+cmd_encrypt() { # dev owner; passphrase on stdin
+	((EUID == 0)) || die "must run as root"
+	local dev=$1 disk
+	[[ -b $dev ]] || die "$dev is not a block device"
+	set_owner "$2"
+	PASS=$(cat)
+	[[ -n $PASS ]] || die "empty passphrase on stdin"
+	install -d -m 700 "$STATE_DIR"
+	disk=$(parent_disk "${dev##*/}")
+	exec {LOCK_FD}>"$STATE_DIR/lock.$disk"
+	flock "$LOCK_FD"
+	trap on_exit EXIT
+	load_props "$dev"
+	detect_kind "$dev" || die "$dev: $REASON"
+	if [[ $KIND == luks ]]; then
+		luks_pending "$dev"
+		[[ -n $REPLY ]] || die "$dev is already encrypted and has nothing to resume"
+		resume_luks "$dev" "$REPLY"
+	else
+		encrypt_device "$dev"
+	fi
+	log "encrypted: $ENC_DEV (LUKS UUID $(cryptsetup luksUUID "$ENC_DEV"))"
+}
+
+case ${1:-} in
+handle) cmd_handle "${2:?kernel device name}" ;;
+check) cmd_check "${2:?device}" ;;
+encrypt) cmd_encrypt "${2:?device}" "${3:?owner}" ;;
+*)
+	printf 'usage: usb-luks handle KNAME | check KNAME | encrypt DEV OWNER <passphrase\n' >&2
+	exit 2
+	;;
+esac
