@@ -1,0 +1,12 @@
+[Unit]
+Description=Reapply quietmode CPU caps
+# sysfs limits reset on reboot and firmware may reset RAPL on resume.
+ConditionPathExists=/var/lib/quietmode/enabled
+After=power-profiles-daemon.service suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/quietmode on
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
