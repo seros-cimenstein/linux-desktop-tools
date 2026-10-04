@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# quietmode — cap CPU frequency/power so the laptop stays cool enough that the
+# fans never spin up.  `quietmode on|off|status [all|local|HOST...]`
+set -euo pipefail
+
+PROG=/usr/local/bin/quietmode
+CONF=/etc/quietmode.conf
+STATE_DIR=/var/lib/quietmode   # survives reboot: "enabled" flag, original PPD profile
+RUN_DIR=/run/quietmode         # per boot: original sysfs values (sysfs resets on reboot)
+CPUFREQ=/sys/devices/system/cpu/cpufreq
+
+MAX_FREQ_MHZ=1400
+NO_TURBO=1
+RAPL_LONG_W=
+RAPL_SHORT_W=
+PPD_PROFILE=power-saver
+PEERS=""
+
+warn() { echo "quietmode: $*" >&2; }
+die() { warn "$*"; exit 1; }
+
+load_conf() {
+	# shellcheck source=/dev/null
+	[[ -r $CONF ]] && . "$CONF"
+	[[ $MAX_FREQ_MHZ =~ ^[0-9]+$ ]] || die "MAX_FREQ_MHZ must be an integer (got '$MAX_FREQ_MHZ')"
+}
+
+have_ppd() { command -v powerprofilesctl >/dev/null && powerprofilesctl get >/dev/null 2>&1; }
+
+# Package power zones (Intel RAPL, both MSR and MMIO interfaces). AMD exposes
+# the zone read-only with no constraints, so the constraint lookup skips it.
+rapl_constraint() { # zone constraint-name -> path of its power_limit_uw
+	local f
+	for f in "$1"/constraint_*_name; do
+		[[ -r $f && $(<"$f") == "$2" ]] && { echo "${f%_name}_power_limit_uw"; return; }
+	done
+	return 0
+}
+
+# Prints "path<TAB>value" for every sysfs write quiet mode makes, in apply order.
+# Turbo goes first: on intel_pstate toggling no_turbo rewrites scaling_max_freq.
+plan() {
+	local f p max min cap zone path
+	if [[ $NO_TURBO == 1 ]]; then
+		f=/sys/devices/system/cpu/intel_pstate/no_turbo
+		[[ -w $f ]] && printf '%s\t1\n' "$f"
+		for f in "$CPUFREQ"/boost "$CPUFREQ"/policy*/boost; do
+			[[ -w $f ]] && printf '%s\t0\n' "$f"
+		done
+	fi
+	for p in "$CPUFREQ"/policy*; do
+		[[ -w $p/scaling_max_freq ]] || continue
+		max=$(<"$p/cpuinfo_max_freq") min=$(<"$p/cpuinfo_min_freq")
+		cap=$((MAX_FREQ_MHZ * 1000))
+		((cap > max)) && cap=$max
+		((cap < min)) && cap=$min
+		printf '%s\t%s\n' "$p/scaling_max_freq" "$cap"
+	done
+	for zone in /sys/class/powercap/intel-rapl:[0-9] /sys/class/powercap/intel-rapl-mmio:[0-9]; do
+		[[ -r $zone/name && $(<"$zone/name") == package-* ]] || continue
+		if [[ -n $RAPL_LONG_W ]]; then
+			path=$(rapl_constraint "$zone" long_term)
+			[[ -n $path ]] && printf '%s\t%s\n' "$path" $((RAPL_LONG_W * 1000000))
+		fi
+		if [[ -n $RAPL_SHORT_W ]]; then
+			path=$(rapl_constraint "$zone" short_term)
+			[[ -n $path ]] && printf '%s\t%s\n' "$path" $((RAPL_SHORT_W * 1000000))
+		fi
+	done
+	return 0
+}
+
+write_sysfs() { # path value -> 0 if the kernel accepted and kept it
+	local got i
+	if ! printf '%s' "$2" 2>/dev/null >"$1"; then
+		warn "write rejected: $1 <- $2"
+		return 1
+	fi
+	# scaling_max_freq goes through a freq-QoS notifier that updates the policy
+	# from a workqueue, so the new value can take a moment to read back.
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		got=$(<"$1")
+		[[ $got == "$2" ]] && return 0
+		sleep 0.1
+	done
+	warn "write ignored: $1 <- $2 (reads back $got; locked by firmware?)"
+	return 1
+}
+
+cmd_on() {
+	local writes path val failed=0
+	load_conf
+	writes=$(plan)
+	[[ -n $writes ]] || die "no writable cpufreq/powercap controls found"
+	mkdir -p "$RUN_DIR" "$STATE_DIR"
+
+	if [[ ! -f $RUN_DIR/orig ]]; then
+		while IFS=$'\t' read -r path val; do
+			printf '%s\t%s\n' "$path" "$(<"$path")"
+		done <<<"$writes" >"$RUN_DIR/orig.tmp"
+		mv "$RUN_DIR/orig.tmp" "$RUN_DIR/orig"
+	fi
+	# PPD persists its own profile across reboots, so its original value has to
+	# live in persistent state or a reboot would make power-saver the "original".
+	if [[ -n $PPD_PROFILE ]] && have_ppd; then
+		[[ -f $STATE_DIR/ppd-orig ]] || powerprofilesctl get >"$STATE_DIR/ppd-orig"
+		powerprofilesctl set "$PPD_PROFILE" || { warn "powerprofilesctl set $PPD_PROFILE failed"; failed=1; }
+	fi
+
+	while IFS=$'\t' read -r path val; do
+		write_sysfs "$path" "$val" || failed=1
+	done <<<"$writes"
+	touch "$STATE_DIR/enabled"
+	return "$failed"
+}
+
+cmd_off() {
+	local path val failed=0
+	if [[ -f $STATE_DIR/ppd-orig ]]; then
+		if have_ppd; then
+			powerprofilesctl set "$(<"$STATE_DIR/ppd-orig")" || { warn "could not restore PPD profile"; failed=1; }
+		fi
+		rm -f "$STATE_DIR/ppd-orig"
+	fi
+	if [[ -f $RUN_DIR/orig ]]; then
+		while IFS=$'\t' read -r path val; do
+			write_sysfs "$path" "$val" || failed=1
+		done <"$RUN_DIR/orig"
+		rm -f "$RUN_DIR/orig"
+	fi
+	rm -f "$STATE_DIR/enabled"
+	return "$failed"
+}
+
+cmd_status() {
+	local h name f p caps="" cur=0 n=0 zone c line="" temps="" fans=""
+	if [[ -f $STATE_DIR/enabled ]]; then echo "quietmode: ON"; else echo "quietmode: off"; fi
+	have_ppd && echo "profile:   $(powerprofilesctl get)"
+	f=/sys/devices/system/cpu/intel_pstate/no_turbo
+	[[ -r $f ]] && echo "turbo:     $([[ $(<"$f") == 1 ]] && echo disabled || echo enabled)"
+	for p in "$CPUFREQ"/policy*; do
+		[[ -r $p/scaling_max_freq ]] || continue
+		caps+="$(($(<"$p/scaling_max_freq") / 1000)) "
+		cur=$((cur + $(<"$p/scaling_cur_freq") / 1000)) n=$((n + 1))
+	done
+	if ((n)); then
+		echo "max freq:  $(tr ' ' '\n' <<<"$caps" | sed '/^$/d' | sort -u | sed 's/$/ MHz/' | paste -sd,) (hw $(($(<"$CPUFREQ/policy0/cpuinfo_max_freq") / 1000)) MHz)"
+		echo "cur freq:  $((cur / n)) MHz avg over $n cpus"
+	fi
+	for zone in /sys/class/powercap/intel-rapl:[0-9] /sys/class/powercap/intel-rapl-mmio:[0-9]; do
+		[[ -r $zone/name && $(<"$zone/name") == package-* ]] || continue
+		line=""
+		for c in long_term short_term; do
+			f=$(rapl_constraint "$zone" "$c")
+			[[ -n $f ]] && line+="$c=$(($(<"$f") / 1000000))W "
+		done
+		[[ -n $line ]] && echo "rapl:      ${zone##*/} $line"
+	done
+	for h in /sys/class/hwmon/hwmon*; do
+		name=$(<"$h/name")
+		case $name in
+		coretemp | k10temp | zenpower) [[ -r $h/temp1_input ]] && temps+="$name $(($(<"$h/temp1_input") / 1000))°C " ;;
+		esac
+		for f in "$h"/fan*_input; do
+			[[ -r $f ]] && fans+="$name $(<"$f") RPM "
+		done
+	done
+	[[ -n $temps ]] && echo "cpu temp:  $temps"
+	[[ -n $fans ]] && echo "fan:       $fans"
+	return 0
+}
+
+run_local() {
+	case $1 in
+	status) cmd_status ;;
+	on | off)
+		if ((EUID == 0)); then "cmd_$1"; else sudo "$PROG" "$1"; fi
+		;;
+	esac
+}
+
+run_remote() { # host verb
+	local tty=()
+	[[ -t 0 && -t 1 ]] && tty=(-t) # lets remote sudo prompt if the NOPASSWD rule is missing
+	ssh "${tty[@]}" -o ConnectTimeout=5 "$1" "$PROG" "$2"
+}
+
+usage() {
+	cat <<EOF
+usage: quietmode on|off|status [all|local|HOST...]
+  on      cap CPU frequency/power so the fans stay off (persists across reboot)
+  off     restore the previous limits
+  status  show current caps, temperature and fan speed
+Targets default to this machine; 'all' = this machine + PEERS from $CONF.
+EOF
+}
+
+main() {
+	local verb=${1:-} rc=0 t targets=()
+	case $verb in
+	on | off | status) shift ;;
+	-h | --help | help) usage; return 0 ;;
+	*) usage >&2; return 2 ;;
+	esac
+	(($#)) || set -- local
+	for t in "$@"; do
+		if [[ $t == all ]]; then
+			load_conf
+			# shellcheck disable=SC2206
+			targets+=(local $PEERS)
+		else
+			targets+=("$t")
+		fi
+	done
+	for t in "${targets[@]}"; do
+		((${#targets[@]} > 1)) && echo "== $t"
+		if [[ $t == local || $t == "$(hostname)" ]]; then
+			run_local "$verb" || rc=1
+		else
+			run_remote "$t" "$verb" || rc=1
+		fi
+	done
+	return "$rc"
+}
+
+main "$@"
