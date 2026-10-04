@@ -71,16 +71,20 @@ plan() {
 }
 
 write_sysfs() { # path value -> 0 if the kernel accepted and kept it
-	local got
+	local got i
 	if ! printf '%s' "$2" 2>/dev/null >"$1"; then
 		warn "write rejected: $1 <- $2"
 		return 1
 	fi
-	got=$(<"$1")
-	if [[ $got != "$2" ]]; then
-		warn "write ignored: $1 <- $2 (reads back $got; locked by firmware?)"
-		return 1
-	fi
+	# scaling_max_freq goes through a freq-QoS notifier that updates the policy
+	# from a workqueue, so the new value can take a moment to read back.
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		got=$(<"$1")
+		[[ $got == "$2" ]] && return 0
+		sleep 0.1
+	done
+	warn "write ignored: $1 <- $2 (reads back $got; locked by firmware?)"
+	return 1
 }
 
 cmd_on() {
