@@ -1,4 +1,4 @@
-vim-mouse
+build/
 xdg-shell.xml
 *-client-protocol.h
 *-protocol.c

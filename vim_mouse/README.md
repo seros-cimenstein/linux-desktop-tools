@@ -1,10 +1,10 @@
 # vim_mouse
 
-Keyboard-driven mouse on sway: jump the pointer anywhere with `$mod+g` (wl-kbptr), then glide and click with vim keys with `$mod+c` (vim-mouse, in this directory).
+Keyboard-driven mouse on sway and on X11 desktops such as Cinnamon: jump the pointer anywhere with `$mod+g` (wl-kbptr on sway, x11-kbptr on X11), then glide and click with vim keys with `$mod+c` (vim-mouse). Everything here lives in this directory except wl-kbptr.
 
 | Key | Action |
 |---|---|
-| `$mod+g` | label grid over the screen; type the 2 letters to move the pointer to that tile (no click) |
+| `$mod+g` | label grid over the screen; type the 2 letters to move the pointer to that tile (no click); `Backspace` undoes a letter, `Esc` cancels |
 | `$mod+c` | start vim-mouse (green square top-right); press again or `Esc` to stop |
 | hold `h j k l` / arrows | glide, accelerating like warpd (220 px/s, +700 px/s², max 1600); two keys = diagonal |
 | `Shift` + direction | slow, steady 50 px/s |
@@ -17,11 +17,16 @@ Speeds are flags on the binding, e.g. `exec vim-mouse --slow-speed 30`; see `vim
 ## Install
 
 ```
-./install.sh            # builds vim-mouse + patched wl-kbptr into ~/.local, links wl-kbptr.conf
+./install.sh            # into ~/.local, no root
 ./install.sh uninstall
 ```
 
-Then add the two bindings it prints to `~/.config/sway/config` and `swaymsg reload`. Build deps: `wayland`, `wayland-protocols`, `libxkbcommon`, `cairo`, `meson`. No root needed.
+The backend follows the session (`$WAYLAND_DISPLAY`, else `$DISPLAY`); over ssh set `VIM_MOUSE_BACKEND=wayland|x11` (and `DISPLAY` / `DBUS_SESSION_BUS_ADDRESS` so the Cinnamon bindings land in the running session).
+
+- **sway**: builds vim-mouse and patched wl-kbptr, links `wl-kbptr.conf`, then prints the two bindings to add to `~/.config/sway/config` before `swaymsg reload`. Build deps: `wayland`, `wayland-protocols`, `libxkbcommon`, `cairo`, `meson`.
+- **X11**: builds vim-mouse and x11-kbptr. On Cinnamon it adds `Super+g` / `Super+c` as custom shortcuts (uninstall removes them); other window managers get the commands printed. Build deps: X11, Xtst, Xext and cairo headers. If they're missing on Debian/Ubuntu/Mint, install.sh fetches the `-dev` packages with `apt-get download` into `~/.local/src/vim-mouse-x11-dev` and links against the runtime libraries already installed, so no root is needed there either.
+
+`make BACKEND=wayland|x11` builds into `build/<backend>/`.
 
 ## Why it's built this way
 
@@ -29,3 +34,8 @@ Then add the two bindings it prints to `~/.config/sway/config` and `swaymsg relo
 - **sway hides the cursor after touchscreen input** and then sends no pointer focus, so IPC moves/clicks go nowhere. vim-mouse sends a zero-length virtual-pointer motion on start, which counts as device activity and unhides it.
 - **Clicking a window bounces keyboard focus** off an exclusive layer surface (`seat_set_focus` in sway's `seat.c`: leave + enter in the same millisecond). vim-mouse therefore only pauses on `leave`, and on `enter` releases whatever isn't in the compositor's list of still-pressed keys, so holds survive clicks and the button can't get stuck.
 - **wl-kbptr patch** (`wl-kbptr-null-keymap.patch`): upstream v0.4.1 segfaults when sway sends modifiers before a keymap (happens after a virtual keyboard such as `wtype` was the last input).
+- **X11: only the bound keys are grabbed** (without Super/Alt), not the whole keyboard: a client holding the keyboard starves the window manager's shortcuts, so `Super+c` couldn't stop vim-mouse and `Super+g` couldn't open the grid on top of it. Unbound keys therefore still reach the focused window while vim-mouse runs (sway swallows them). Once a bound key goes down the whole keyboard is held until every key is up, so staggered releases of diagonals and drags aren't lost.
+- **X11 motion is absolute** (XTest): relative XTest motion goes through the server's pointer acceleration and would distort the glide.
+- **x11-kbptr** reimplements wl-kbptr's tile mode (same grid size, label order, `wl-kbptr.conf` colours built in), since wl-kbptr is Wayland-only.
+
+`vim-mouse.c` holds the glide, key state and option handling; `backend-wayland.c` / `backend-x11.c` hold the keyboard grab, indicator and pointer injection.
