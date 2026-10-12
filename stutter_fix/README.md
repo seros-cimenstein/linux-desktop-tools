@@ -12,16 +12,30 @@ wlroots 0.19, foot 1.28.
 ./install.sh        # re-runs itself with sudo
 ```
 
-It does three things:
+It does four things:
 
-1. `setcap -r /usr/bin/sway`: future sway sessions no longer make their main thread realtime.
+1. `setcap -r /usr/bin/sway`: removes the capability that lets sway make its main thread realtime.
 2. Installs `sway-no-realtime.hook` into `/etc/pacman.d/hooks/`. The sway package runs
    `setcap cap_sys_nice+ep usr/bin/sway` in `post_upgrade`; the hook removes it again
    after every sway install or upgrade.
-3. `chrt --other --all-tasks --pid 0 <sway>`: switches the running sway to normal scheduling,
+3. Installs `sway-wrapper.sh` as `/usr/local/bin/sway` (ahead of `/usr/bin` in `PATH`). It runs
+   `prlimit --rtprio=0: /usr/bin/sway`, which closes the second way sway can become realtime
+   (see below). Only the soft limit is lowered; the hard limit stays at 99, so programs started
+   from sway can raise it again.
+4. `chrt --other --all-tasks --pid 0 <sway>`: switches the running sway to normal scheduling,
    so no logout is needed.
 
 sway keeps its nice −12 from ananicy-cpp; only realtime scheduling is removed.
+
+### Why steps 1–2 alone were not enough
+
+sway calls `pthread_setschedparam(SCHED_RR, 1)` at startup (`sway/realtime.c`). That call
+succeeds with `cap_sys_nice` **or** with a non-zero `RLIMIT_RTPRIO`. `cachyos-settings`
+1.4.1 (installed 2026-09-26) ships `/etc/security/limits.d/20-audio.conf`
+(`@audio - rtprio 99`), and this user is in `audio`. The capability was removed on
+2026-10-10 and the running sway was switched with `chrt`, so everything looked fixed. The next
+sway start (after a reboot) became `SCHED_RR` again through the rlimit, with `getcap` still
+empty. The wrapper in step 3 blocks this path.
 
 ## Cause
 
@@ -90,14 +104,15 @@ Ruled out:
 
 ```sh
 getcap /usr/bin/sway                     # prints nothing
-chrt --pid "$(pidof sway)"               # SCHED_OTHER
+command -v sway                          # /usr/local/bin/sway
+chrt --pid "$(pidof sway)"               # SCHED_OTHER, also after a reboot
 python3 tools/sway-stall-capture.py 180  # episodes=0
 ```
 
 ## Revert
 
 ```sh
-sudo rm /etc/pacman.d/hooks/sway-no-realtime.hook
+sudo rm /etc/pacman.d/hooks/sway-no-realtime.hook /usr/local/bin/sway
 sudo setcap cap_sys_nice+ep /usr/bin/sway   # takes effect at the next sway start
 ```
 
