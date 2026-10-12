@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = sway
+
+[Action]
+Description = Removing cap_sys_nice from sway (realtime main thread starves i915 workers -> ~1 s input freezes)
+When = PostTransaction
+Exec = /bin/sh -c '/usr/bin/setcap -r /usr/bin/sway 2>/dev/null || true'
