@@ -14,10 +14,12 @@
 #include <math.h>
 #include <poll.h>
 #include <stdio.h>
+#include <time.h>
 
 #include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
+#include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/shape.h>
@@ -30,8 +32,15 @@ static struct {
 	Window root, indicator;
 	int width, height;
 	int xkb_event;
-	/* Whole-keyboard grab held while any key is down (see handle_event). */
+	/* Whole-keyboard grab held while any key is down or a menu we saw open
+	 * during it is still mapped (see handle_event). */
 	bool grabbed;
+	/* Mapped popup menu windows (override-redirect, menu window type). */
+	Window menus[16];
+	int num_menus;
+	Atom wm_window_type, menu_types[4];
+	/* CLOCK_MONOTONIC ms until which a right click's menu may still appear, 0 if none. */
+	int64_t menu_deadline;
 	/* Sub-pixel pointer position and the pixel we last moved it to. */
 	double x, y;
 	int sent_x, sent_y;
@@ -64,11 +73,23 @@ void backend_motion(double dx, double dy)
 	}
 }
 
+#define MENU_WAIT_MS 1000 /* how long a right click's menu may take to appear */
+
+static int64_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 void backend_button(enum vm_button button, bool pressed)
 {
 	XTestFakeButtonEvent(x.dpy, button == VM_BUTTON_LEFT ? Button1 : Button3, pressed,
 			     CurrentTime);
 	XFlush(x.dpy);
+	/* Keep the keyboard until the menu shows up (see release_keyboard). */
+	if (button == VM_BUTTON_RIGHT && !pressed && x.grabbed)
+		x.menu_deadline = now_ms() + MENU_WAIT_MS;
 }
 
 void backend_click(void)
@@ -103,6 +124,54 @@ static bool any_key_down(void)
 	return false;
 }
 
+/* Override-redirect windows typed as menus: what browsers and toolkits pop up. */
+static bool is_menu(Window win)
+{
+	Atom type;
+	int format;
+	unsigned long count, after;
+	unsigned char *data = NULL;
+	bool menu = false;
+	if (XGetWindowProperty(x.dpy, win, x.wm_window_type, 0, 8, False, XA_ATOM, &type, &format,
+			       &count, &after, &data) == Success && data) {
+		const Atom *types = (const Atom *)data;
+		for (unsigned long i = 0; i < count && !menu; i++) {
+			for (size_t t = 0; t < sizeof x.menu_types / sizeof *x.menu_types; t++)
+				menu |= types[i] == x.menu_types[t];
+		}
+	}
+	XFree(data);
+	return menu;
+}
+
+static void forget_menu(Window win)
+{
+	for (int i = 0; i < x.num_menus; i++) {
+		if (x.menus[i] == win) {
+			x.menus[i] = x.menus[--x.num_menus];
+			return;
+		}
+	}
+}
+
+/*
+ * Grabbing the keyboard sends the focused window a FocusOut, and Firefox closes
+ * its menus on FocusOut, so a menu opened by Return would close on the next
+ * key press, before Space could click an item. The grab Return started is
+ * therefore kept until its menu appears (a menu can take a while, Return is
+ * usually up by then) and for as long as a menu is open; ungrabbing gives a
+ * FocusIn, which closes nothing.
+ */
+static void release_keyboard(Time time)
+{
+	if (x.menu_deadline && now_ms() >= x.menu_deadline)
+		x.menu_deadline = 0;
+	if (x.grabbed && !x.menu_deadline && x.num_menus == 0 && !any_key_down()) {
+		XUngrabKeyboard(x.dpy, time);
+		x.grabbed = false;
+	}
+}
+
 static void handle_event(XEvent *ev)
 {
 	if (ev->type == KeyPress || ev->type == KeyRelease) {
@@ -119,10 +188,19 @@ static void handle_event(XEvent *ev)
 						XkbGroupForCoreState(ev->xkey.state), 0);
 		vm_key(ev->xkey.keycode, keysym_action(sym), pressed);
 
-		if (!pressed && x.grabbed && !any_key_down()) {
-			XUngrabKeyboard(x.dpy, ev->xkey.time);
-			x.grabbed = false;
+		if (!pressed)
+			release_keyboard(ev->xkey.time);
+	} else if (ev->type == MapNotify) {
+		/* Only menus opened while we hold the keyboard: grabbing for one
+		 * that is already open would close it. */
+		if (x.grabbed && ev->xmap.override_redirect &&
+		    x.num_menus < (int)(sizeof x.menus / sizeof *x.menus) && is_menu(ev->xmap.window)) {
+			x.menus[x.num_menus++] = ev->xmap.window;
+			x.menu_deadline = 0;
 		}
+	} else if (ev->type == UnmapNotify || ev->type == DestroyNotify) {
+		forget_menu(ev->type == UnmapNotify ? ev->xunmap.window : ev->xdestroywindow.window);
+		release_keyboard(CurrentTime);
 	} else if (ev->type == x.xkb_event) {
 		XkbEvent *xkb = (XkbEvent *)ev;
 		if (xkb->any.xkb_type == XkbStateNotify)
@@ -133,13 +211,16 @@ static void handle_event(XEvent *ev)
 static XErrorHandler default_error_handler;
 static int grab_conflicts;
 
-/* BadAccess on XGrabKey: another client already owns that key combination. */
+/* BadAccess on XGrabKey: another client already owns that key combination.
+ * BadWindow: a window mapped by another client was gone before is_menu(). */
 static int on_x_error(Display *dpy, XErrorEvent *err)
 {
 	if (err->error_code == BadAccess && err->request_code == X_GrabKey) {
 		grab_conflicts++;
 		return 0;
 	}
+	if (err->error_code == BadWindow)
+		return 0;
 	return default_error_handler(dpy, err);
 }
 
@@ -154,7 +235,6 @@ static void grab_keys(void)
 	static const unsigned int mods[] = {0, ShiftMask, ControlMask, ShiftMask | ControlMask};
 	static const unsigned int locks[] = {0, LockMask, Mod2Mask, LockMask | Mod2Mask};
 
-	default_error_handler = XSetErrorHandler(on_x_error);
 	for (size_t i = 0; i < sizeof keys / sizeof *keys; i++) {
 		KeyCode code = XKeysymToKeycode(x.dpy, keys[i]);
 		if (!code)
@@ -166,7 +246,6 @@ static void grab_keys(void)
 		}
 	}
 	XSync(x.dpy, False);
-	XSetErrorHandler(default_error_handler);
 	if (grab_conflicts)
 		fprintf(stderr, "vim-mouse: %d key combinations are taken by other shortcuts\n",
 			grab_conflicts);
@@ -224,6 +303,13 @@ int main(int argc, char **argv)
 	if (XkbGetState(x.dpy, XkbUseCoreKbd, &state) == Success)
 		set_modifiers(state.mods);
 
+	default_error_handler = XSetErrorHandler(on_x_error);
+	x.wm_window_type = XInternAtom(x.dpy, "_NET_WM_WINDOW_TYPE", False);
+	x.menu_types[0] = XInternAtom(x.dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+	x.menu_types[1] = XInternAtom(x.dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+	x.menu_types[2] = XInternAtom(x.dpy, "_NET_WM_WINDOW_TYPE_COMBO", False);
+	x.menu_types[3] = XInternAtom(x.dpy, "_NET_WM_WINDOW_TYPE_MENU", False); /* Chromium */
+	XSelectInput(x.dpy, x.root, SubstructureNotifyMask);
 	grab_keys();
 	create_indicator();
 	vm_focus(true);
@@ -241,7 +327,13 @@ int main(int argc, char **argv)
 		}
 		if (!vm_running())
 			break;
-		if (poll(fds, 1 + VM_NUM_FDS, -1) < 0) {
+		int timeout = -1;
+		if (x.menu_deadline) {
+			int64_t left = x.menu_deadline - now_ms();
+			timeout = left > 0 ? (int)left : 0;
+		}
+		int ready = poll(fds, 1 + VM_NUM_FDS, timeout);
+		if (ready < 0) {
 			if (errno == EINTR)
 				continue;
 			perror("vim-mouse: poll");
@@ -249,6 +341,8 @@ int main(int argc, char **argv)
 		}
 		if (fds[0].revents & (POLLERR | POLLHUP))
 			break;
+		if (ready == 0) /* no menu appeared after the right click */
+			release_keyboard(CurrentTime);
 		vm_dispatch(fds + 1);
 	}
 
