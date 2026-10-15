@@ -9,7 +9,7 @@ Keyboard-driven mouse on sway and on X11 desktops such as Cinnamon: jump the poi
 | hold `h j k l` / arrows | glide, accelerating like warpd (220 px/s, +700 px/s², max 1600); two keys = diagonal |
 | `Shift` + direction | slow, steady 50 px/s |
 | `Ctrl` + direction | accelerate ~4× faster |
-| hold `Space` | left button stays down while held: tap = click, hold + glide = drag |
+| `Space` | tap = left click; hold (300 ms) or glide while it's down = left button held for a drag |
 | `Return` | right click |
 
 Speeds are flags on the binding, e.g. `exec vim-mouse --slow-speed 30`; see `vim-mouse --help`.
@@ -33,6 +33,7 @@ The backend follows the session (`$WAYLAND_DISPLAY`, else `$DISPLAY`); over ssh 
 - **vim-mouse vs a sway mode**: sway bindings fire on key repeat, so `seat - cursor move` jumps in steps after a 600 ms repeat delay. vim-mouse grabs the keyboard through a 12 px layer-shell square and drives a wlr-virtual-pointer at 125 Hz from key press/release, so motion is continuous and sub-pixel.
 - **sway hides the cursor after touchscreen input** and then sends no pointer focus, so IPC moves/clicks go nowhere. vim-mouse sends a zero-length virtual-pointer motion on start, which counts as device activity and unhides it.
 - **Clicking a window bounces keyboard focus** off an exclusive layer surface (`seat_set_focus` in sway's `seat.c`: leave + enter in the same millisecond). vim-mouse therefore only pauses on `leave`, and on `enter` releases whatever isn't in the compositor's list of still-pressed keys, so holds survive clicks and the button can't get stuck.
+- **A Space tap releases the keyboard for the click**: when sway takes the focus back from the clicked window it unfocuses it, which closes that window's popups (`send_unfocus` → `view_close_popups`) before the click arrives, so a context-menu item (Return, then Space on "Open link in new tab") could never be clicked. vim-mouse waits for Space's release to tell a tap from a hold, then sets the layer surface's keyboard interactivity to none, sends press + release, and grabs again. Drags keep the grab (the release must be seen), so the button goes down only after 300 ms of holding or when a glide starts.
 - **wl-kbptr patch** (`wl-kbptr-null-keymap.patch`): upstream v0.4.1 segfaults when sway sends modifiers before a keymap (happens after a virtual keyboard such as `wtype` was the last input).
 - **X11: only the bound keys are grabbed** (without Super/Alt), not the whole keyboard: a client holding the keyboard starves the window manager's shortcuts, so `Super+c` couldn't stop vim-mouse and `Super+g` couldn't open the grid on top of it. Unbound keys therefore still reach the focused window while vim-mouse runs (sway swallows them). Once a bound key goes down the whole keyboard is held until every key is up, so staggered releases of diagonals and drags aren't lost.
 - **X11 motion is absolute** (XTest): relative XTest motion goes through the server's pointer acceleration and would distort the glide.

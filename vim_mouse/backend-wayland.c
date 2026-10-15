@@ -66,6 +66,33 @@ void backend_button(enum vm_button button, bool pressed)
 	wl_display_flush(wl.display);
 }
 
+static void set_keyboard_grab(bool on)
+{
+	zwlr_layer_surface_v1_set_keyboard_interactivity(wl.layer_surface, on ? 1 : 0); /* exclusive / none */
+	wl_surface_commit(wl.surface);
+}
+
+/*
+ * A click into a window while we hold the exclusive keyboard focus makes sway
+ * focus that window and immediately hand the focus back to us, and taking it
+ * back unfocuses the window, which closes its popups (send_unfocus ->
+ * view_close_popups in sway's seat.c) before the click is delivered: a
+ * context menu item could never be clicked. So the grab is dropped for the
+ * click. Sway then refocuses the window without unfocusing it first, press
+ * and release land in the popup, and only after them do we take focus back.
+ * Requests are handled in order, so no roundtrip is needed in between.
+ * A drag (button held while we must keep seeing keys) still goes through
+ * the focus bounce.
+ */
+void backend_click(void)
+{
+	set_keyboard_grab(false);
+	backend_button(VM_BUTTON_LEFT, true);
+	backend_button(VM_BUTTON_LEFT, false);
+	set_keyboard_grab(true);
+	wl_display_flush(wl.display);
+}
+
 /* ---- keyboard ---- */
 
 static void keyboard_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
@@ -294,8 +321,7 @@ static void create_indicator(void)
 	zwlr_layer_surface_v1_set_anchor(wl.layer_surface, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
 							   ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
 	zwlr_layer_surface_v1_set_margin(wl.layer_surface, INDICATOR_MARGIN, INDICATOR_MARGIN, 0, 0);
-	zwlr_layer_surface_v1_set_keyboard_interactivity(wl.layer_surface, 1); /* exclusive */
-	wl_surface_commit(wl.surface);
+	set_keyboard_grab(true);
 }
 
 /* ---- main ---- */

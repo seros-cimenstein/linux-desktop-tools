@@ -2,10 +2,11 @@
  * vim-mouse: smooth keyboard pointer control.
  *
  * Moves the pointer while h/j/k/l (or arrows) are held, with warpd-style
- * acceleration. Space holds the left button for as long as it is held
- * (click or drag). Runs until Esc; launching it again while it runs stops
- * the running instance (toggle from one keybinding). The keyboard grab,
- * indicator and pointer injection live in backend-wayland.c / backend-x11.c.
+ * acceleration. A Space tap clicks; holding Space, or gliding while it is
+ * down, holds the left button for a drag. Runs until Esc; launching it again
+ * while it runs stops the running instance (toggle from one keybinding). The
+ * keyboard grab, indicator and pointer injection live in backend-wayland.c /
+ * backend-x11.c.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -24,7 +25,8 @@
 
 #include "vim-mouse.h"
 
-#define TICK_NS 8000000L /* 125 Hz motion updates */
+#define TICK_NS 8000000L    /* 125 Hz motion updates */
+#define HOLD_NS 300000000L  /* Space held this long without a glide starts a drag */
 #define MAX_KEYCODE 768
 
 enum dir { LEFT, DOWN, UP, RIGHT, NUM_DIRS };
@@ -48,6 +50,9 @@ static struct {
 
 	/* Keycode holding the left button down, -1 if the button is up. */
 	int drag_key;
+	/* Keycode of a Space press that is not yet a click or a drag, -1 if none. */
+	int pending_key;
+	int hold_fd;
 
 	int timer_fd;
 	bool moving;
@@ -66,8 +71,35 @@ static double elapsed_s(const struct timespec *a, const struct timespec *b)
 	return (double)(b->tv_sec - a->tv_sec) + (double)(b->tv_nsec - a->tv_nsec) / 1e9;
 }
 
+static void set_hold_timer(bool on)
+{
+	struct itimerspec spec = {0};
+	if (on)
+		spec.it_value.tv_nsec = HOLD_NS;
+	timerfd_settime(st.hold_fd, 0, &spec, NULL);
+}
+
+/* Forget a Space press that never became a click or a drag. */
+static void cancel_pending(void)
+{
+	if (st.pending_key >= 0) {
+		set_hold_timer(false);
+		st.pending_key = -1;
+	}
+}
+
+/* The pending Space press is a hold: put the button down until it is released. */
+static void start_drag(void)
+{
+	set_hold_timer(false);
+	backend_button(VM_BUTTON_LEFT, true);
+	st.drag_key = st.pending_key;
+	st.pending_key = -1;
+}
+
 void vm_release_buttons(void)
 {
+	cancel_pending();
 	if (st.drag_key >= 0) {
 		backend_button(VM_BUTTON_LEFT, false);
 		st.drag_key = -1;
@@ -166,6 +198,9 @@ void vm_key(uint32_t code, enum vm_action action, bool pressed)
 			st.held[(int)st.key_dir[code]]--;
 			st.key_dir[code] = -1;
 			update_motion();
+		} else if ((int)code == st.pending_key) {
+			cancel_pending();
+			backend_click();
 		} else if ((int)code == st.drag_key) {
 			vm_release_buttons();
 		}
@@ -182,17 +217,28 @@ void vm_key(uint32_t code, enum vm_action action, bool pressed)
 			[VM_LEFT] = LEFT, [VM_DOWN] = DOWN, [VM_UP] = UP, [VM_RIGHT] = RIGHT,
 		};
 		enum dir dir = dirs[action];
+		/* Gliding with Space down drags from where Space went down. */
+		if (st.pending_key >= 0)
+			start_drag();
 		st.key_dir[code] = (signed char)dir;
 		st.held[dir]++;
 		update_motion();
 		break;
 	}
-	case VM_DRAG:
-		if (st.drag_key < 0) {
-			backend_button(VM_BUTTON_LEFT, true);
-			st.drag_key = (int)code;
-		}
+	case VM_DRAG: {
+		/* The button goes down only once this is a drag; a tap becomes one
+		 * backend_click() on release (see backend-wayland.c for why). */
+		if (st.drag_key >= 0 || st.pending_key >= 0)
+			break;
+		st.pending_key = (int)code;
+		double x, y;
+		direction(&x, &y);
+		if (x != 0 || y != 0)
+			start_drag();
+		else
+			set_hold_timer(true);
 		break;
+	}
 	case VM_MENU:
 		backend_button(VM_BUTTON_RIGHT, true);
 		backend_button(VM_BUTTON_RIGHT, false);
@@ -220,8 +266,12 @@ void vm_focus(bool focused)
 void vm_sync_keys(bool (*still_down)(uint32_t code, void *data), void *data)
 {
 	for (uint32_t code = 0; code < MAX_KEYCODE; code++) {
-		if (st.down[code] && !still_down(code, data))
-			vm_key(code, VM_NONE, false);
+		if (!st.down[code] || still_down(code, data))
+			continue;
+		/* A tap we could not see happen is not a click. */
+		if ((int)code == st.pending_key)
+			cancel_pending();
+		vm_key(code, VM_NONE, false);
 	}
 }
 
@@ -230,7 +280,8 @@ void vm_sync_keys(bool (*still_down)(uint32_t code, void *data), void *data)
 void vm_fds(struct pollfd fds[VM_NUM_FDS])
 {
 	fds[0] = (struct pollfd){.fd = st.timer_fd, .events = POLLIN};
-	fds[1] = (struct pollfd){.fd = st.signal_fd, .events = POLLIN};
+	fds[1] = (struct pollfd){.fd = st.hold_fd, .events = POLLIN};
+	fds[2] = (struct pollfd){.fd = st.signal_fd, .events = POLLIN};
 }
 
 void vm_dispatch(const struct pollfd fds[VM_NUM_FDS])
@@ -240,7 +291,12 @@ void vm_dispatch(const struct pollfd fds[VM_NUM_FDS])
 		if (read(st.timer_fd, &expirations, sizeof expirations) > 0)
 			tick();
 	}
-	if (fds[1].revents & POLLIN)
+	if (fds[1].revents & POLLIN) {
+		uint64_t expirations;
+		if (read(st.hold_fd, &expirations, sizeof expirations) > 0 && st.pending_key >= 0)
+			start_drag();
+	}
+	if (fds[2].revents & POLLIN)
 		st.running = false;
 }
 
@@ -296,7 +352,7 @@ static void usage(FILE *out)
 	fprintf(out,
 		"usage: vim-mouse [options]\n"
 		"  hjkl/arrows move (hold; diagonals work), Shift = slow, Ctrl = faster,\n"
-		"  Space = hold left button (click/drag), Return = right click, Esc = quit.\n"
+		"  Space = click (tap) / drag (hold), Return = right click, Esc = quit.\n"
 		"  Running it again while active stops the active instance.\n\n"
 		"  --speed N       initial speed px/s      (default %g)\n"
 		"  --max-speed N   maximum speed px/s      (default %g)\n"
@@ -346,10 +402,12 @@ bool vm_init(int argc, char **argv)
 
 	memset(st.key_dir, -1, sizeof st.key_dir);
 	st.drag_key = -1;
+	st.pending_key = -1;
 	st.running = true;
 
 	st.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-	if (st.timer_fd < 0) {
+	st.hold_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	if (st.timer_fd < 0 || st.hold_fd < 0) {
 		perror("vim-mouse: timerfd");
 		exit(1);
 	}

@@ -71,6 +71,12 @@ void backend_button(enum vm_button button, bool pressed)
 	XFlush(x.dpy);
 }
 
+void backend_click(void)
+{
+	backend_button(VM_BUTTON_LEFT, true);
+	backend_button(VM_BUTTON_LEFT, false);
+}
+
 static enum vm_action keysym_action(KeySym sym)
 {
 #define K(name, action) case XK_##name: return action;

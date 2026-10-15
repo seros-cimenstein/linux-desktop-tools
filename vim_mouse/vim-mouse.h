@@ -33,13 +33,15 @@ enum vm_button { VM_BUTTON_LEFT, VM_BUTTON_RIGHT };
 /* Implemented by the backend. */
 void backend_motion(double dx, double dy);
 void backend_button(enum vm_button button, bool pressed);
+/* One left click (press + release), for a Space tap. */
+void backend_click(void);
 
 /* Parses options and takes the single-instance lock. Returns false if it
  * stopped an already running instance instead (the caller should exit 0). */
 bool vm_init(int argc, char **argv);
 
 /* The core's timer and signal fds, for the backend's poll loop. */
-#define VM_NUM_FDS 2
+#define VM_NUM_FDS 3
 void vm_fds(struct pollfd fds[VM_NUM_FDS]);
 void vm_dispatch(const struct pollfd fds[VM_NUM_FDS]);
 bool vm_running(void);
