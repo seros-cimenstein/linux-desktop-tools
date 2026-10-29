@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Bridge short contact dropouts on a finger-only touchscreen used with an active stylus.
+
+Grabs the touchscreen exclusively and re-emits it through a uinput clone.
+
+Gap bridging: every lift is held back for --gap ms; if a new contact lands within --dist
+device units of where the held one lifted, it continues the same contact (same tracking
+ID) instead of starting a new stroke. Otherwise the held lift is released when it expires.
+
+Smoothing: output is played back about --smooth ms behind the pen, at a rate steered by
+how much data is buffered. When the panel stops reporting (it repeats a position, or a
+bridged dropout), playback slows down instead of freezing; when data resumes it catches
+up at up to CATCHUP x real time. Between reported points the path follows a Hermite curve
+that keeps the pen's direction into and out of each gap, so gaps are not straight chords.
+"""
+import argparse
+import math
+import select
+import sys
+import time
+
+import evdev
+from evdev import ecodes as e
+
+
+class Bridge:
+    """Contact-merging state machine: input frames in, ("down"|"move"|"up", ...) ops out."""
+
+    def __init__(self, nslots, gap, dist, log=None):
+        self.gap, self.dist, self.log = gap, dist, log
+        self.out = [None] * nslots   # out slot -> {"x", "y", "lift_at", "down", "moved", "freeze"}
+        self.bind = {}               # in slot -> out slot
+        self.pos = {}                # in slot -> [x, y]; kernel keeps slot values across contacts
+        self.tid = 0
+        self.last_lift = None        # (time, x, y) of the latest input lift, for --verbose
+
+    def deadline(self):
+        times = [c["lift_at"] for c in self.out if c and c["lift_at"] is not None]
+        return min(times) if times else None
+
+    def _release(self, o, ops, now):
+        c = self.out[o]
+        if self.log:
+            self.log(f"stroke   {(now - c['down']) * 1000:5.0f} ms long, longest freeze {c['freeze'] * 1000:3.0f} ms")
+        ops.append(("up", o))
+        self.out[o] = None
+
+    def _lift(self, s, now, ops):
+        o = self.bind.pop(s, None)
+        if o is None:
+            return
+        c = self.out[o]
+        self.last_lift = (now, c["x"], c["y"])
+        if self.gap > 0:
+            c["lift_at"] = now + self.gap
+        else:
+            self._release(o, ops, now)
+
+    def _down(self, s, now, ops):
+        x, y = self.pos[s]
+        held = [(math.dist((x, y), (c["x"], c["y"])), o) for o, c in enumerate(self.out)
+                if c and c["lift_at"] is not None and c["lift_at"] > now]
+        held = [h for h in held if h[0] <= self.dist]
+        if self.log and self.last_lift and now - self.last_lift[0] < 1:
+            dt = (now - self.last_lift[0]) * 1000
+            d = math.dist((x, y), self.last_lift[1:]) if self.last_lift[1] is not None else 0
+            self.log(f"bridged  {dt:3.0f} ms gap, {d:3.0f} px jump" if held else
+                     f"SPLIT    {dt:3.0f} ms gap, {d:3.0f} px jump (limits {self.gap * 1000:g} ms / {self.dist:g} px)")
+        if held:
+            o = min(held)[1]
+            self.out[o]["lift_at"] = None
+            self.out[o]["moved"] = now
+        else:
+            free = [o for o, c in enumerate(self.out) if c is None]
+            if not free:  # every slot busy or held: give up the oldest held contact
+                pending = [(c["lift_at"], o) for o, c in enumerate(self.out) if c["lift_at"]]
+                if not pending:
+                    return
+                o = min(pending)[1]
+                self._release(o, ops, now)
+            else:
+                o = s if s in free else free[0]
+            self.tid = (self.tid + 1) & 0xFFFF
+            self.out[o] = {"x": None, "y": None, "lift_at": None, "down": now, "moved": now, "freeze": 0.0}
+            ops.append(("down", o, self.tid))
+        self.bind[s] = o
+
+    def frame(self, changes, now):
+        """changes: {in_slot: {"tid"?, "x"?, "y"?}} from one SYN_REPORT frame."""
+        ops = self.expire(now)
+        for s, ch in changes.items():
+            p = self.pos.setdefault(s, [0, 0])
+            p[0], p[1] = ch.get("x", p[0]), ch.get("y", p[1])
+            if "tid" in ch:
+                self._lift(s, now, ops)        # a new ID on a bound slot implies a lift
+                if ch["tid"] != -1:
+                    self._down(s, now, ops)
+            o = self.bind.get(s)
+            if o is not None:
+                c = self.out[o]
+                if (c["x"], c["y"]) != tuple(p):
+                    ops.append(("move", o, p[0], p[1]))
+                    c["x"], c["y"] = p
+                    c["freeze"] = max(c["freeze"], now - c["moved"])
+                    c["moved"] = now
+        return ops
+
+    def expire(self, now):
+        ops = []
+        for o, c in enumerate(self.out):
+            if c and c["lift_at"] is not None and c["lift_at"] <= now:
+                self._release(o, ops, now)
+        return ops
+
+
+class Output:
+    """Turns contact ops into evdev events; tracks what the virtual device currently shows."""
+
+    def __init__(self):
+        self.shown = {}              # out slot -> (x, y) currently on the virtual device
+        self.touch = False
+        self.primary = None          # last emitted (ABS_X, ABS_Y)
+
+    def _show_down(self, ev, o, tid, x, y):
+        ev += [(e.EV_ABS, e.ABS_MT_SLOT, o), (e.EV_ABS, e.ABS_MT_TRACKING_ID, tid),
+               (e.EV_ABS, e.ABS_MT_POSITION_X, x), (e.EV_ABS, e.ABS_MT_POSITION_Y, y)]
+        self.shown[o] = (x, y)
+
+    def _show_move(self, ev, o, x, y):
+        if self.shown.get(o) != (x, y):
+            ev += [(e.EV_ABS, e.ABS_MT_SLOT, o),
+                   (e.EV_ABS, e.ABS_MT_POSITION_X, x), (e.EV_ABS, e.ABS_MT_POSITION_Y, y)]
+            self.shown[o] = (x, y)
+
+    def _show_up(self, ev, o):
+        if self.shown.pop(o, None) is not None:
+            ev += [(e.EV_ABS, e.ABS_MT_SLOT, o), (e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)]
+
+    def _sync(self, ev):
+        """End the current evdev frame inside one batch (so a press and its release never share a frame)."""
+        self._finish(ev)
+        ev.append((e.EV_SYN, e.SYN_REPORT, 0))
+
+    def _finish(self, ev):
+        if bool(self.shown) != self.touch:
+            self.touch = bool(self.shown)
+            ev.append((e.EV_KEY, e.BTN_TOUCH, int(self.touch)))
+        if self.shown:
+            p = self.shown[min(self.shown)]
+            if p != self.primary:
+                self.primary = p
+                ev += [(e.EV_ABS, e.ABS_X, p[0]), (e.EV_ABS, e.ABS_Y, p[1])]
+        return ev
+
+    def next_tick(self):
+        return None
+
+
+class Direct(Output):
+    """Writes ops through as they happen."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending = {}            # out slot -> tid, until its first position arrives
+
+    def update(self, ops, now):
+        ev = []
+        for op in ops:
+            if op[0] == "down":
+                self.pending[op[1]] = op[2]
+            elif op[0] == "move":
+                tid = self.pending.pop(op[1], None)
+                if tid is not None:
+                    self._show_down(ev, op[1], tid, op[2], op[3])
+                else:
+                    self._show_move(ev, op[1], op[2], op[3])
+            elif op[0] == "up":
+                self.pending.pop(op[1], None)
+                self._show_up(ev, op[1])
+        return self._finish(ev)
+
+
+class Smooth(Output):
+    """Rate-controlled playout about `lag` seconds behind the pen, with curved gap filling."""
+
+    TICK = 1 / 125
+    CATCHUP = 1.5                # max playback speed while recovering lag after a gap
+
+    def __init__(self, lag):
+        super().__init__()
+        self.lag = lag
+        self.contacts = {}           # out slot -> {"tid", "keys": [(t, x, y)], "up", "tau", "last"}
+
+    @staticmethod
+    def _segment(k, i, tau):
+        """Position at tau between keyframes k[i] and k[i+1]: Hermite curve whose end tangents
+        are the pen velocity into and out of the segment, clamped to the chord (no loops)."""
+        t1, x1, y1 = k[i]
+        t2, x2, y2 = k[i + 1]
+        T = t2 - t1
+        s = (tau - t1) / T
+        chord = math.hypot(x2 - x1, y2 - y1)
+
+        def tangent(a, b):
+            dt = b[0] - a[0]
+            m = ((b[1] - a[1]) / dt * T, (b[2] - a[2]) / dt * T) if dt > 0 else (x2 - x1, y2 - y1)
+            n = math.hypot(*m)
+            return m if n <= chord else (m[0] * chord / n, m[1] * chord / n)
+
+        m1 = tangent(k[i - 1], k[i]) if i > 0 else (x2 - x1, y2 - y1)
+        m2 = tangent(k[i + 1], k[i + 2]) if i + 2 < len(k) else (x2 - x1, y2 - y1)
+        h00, h10 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s
+        h01, h11 = -2 * s**3 + 3 * s**2, s**3 - s**2
+        return (round(h00 * x1 + h10 * m1[0] + h01 * x2 + h11 * m2[0]),
+                round(h00 * y1 + h10 * m1[1] + h01 * y2 + h11 * m2[1]))
+
+    def _pos(self, c, tau):
+        k = c["keys"]
+        while len(k) >= 3 and k[2][0] <= tau:
+            k.pop(0)                 # keep one keyframe before the current segment for its tangent
+        i = 1 if len(k) >= 2 and k[1][0] <= tau else 0
+        if i + 1 >= len(k) or tau <= k[i][0]:
+            return k[min(i, len(k) - 1)][1:]
+        return self._segment(k, i, tau)
+
+    def _lift(self, ev, o, c, fresh):
+        self._show_move(ev, o, *c["keys"][-1][1:])
+        if fresh:
+            self._sync(ev)           # a press and its release never share a frame
+        self._show_up(ev, o)
+
+    def update(self, ops, now):
+        ev = []
+        for op in ops:
+            o = op[1]
+            if op[0] == "down":
+                old = self.contacts.pop(o, None)
+                if old and old["keys"]:  # slot reused before the old contact finished playing
+                    fresh = o not in self.shown
+                    if fresh:
+                        self._show_down(ev, o, old["tid"], *old["keys"][0][1:])
+                    self._lift(ev, o, old, fresh)
+                self.contacts[o] = {"tid": op[2], "keys": [], "up": False, "tau": None, "last": None}
+            elif op[0] == "move":
+                self.contacts[o]["keys"].append((now, op[2], op[3]))
+            elif op[0] == "up":
+                self.contacts[o]["up"] = True
+        for o in list(self.contacts):
+            c = self.contacts[o]
+            k = c["keys"]
+            if not k:                # no position yet
+                if c["up"]:
+                    del self.contacts[o]
+                continue
+            fresh = c["tau"] is None
+            if fresh:
+                if now - k[0][0] < self.lag and not c["up"]:
+                    continue         # build up the initial buffer
+                c["tau"], c["last"] = k[0][0], now
+                self._show_down(ev, o, c["tid"], *k[0][1:])
+            else:
+                # playback rate follows the buffered lead: < 1 when data runs out, up to CATCHUP after
+                rate = min(self.CATCHUP, (k[-1][0] - c["tau"]) / self.lag)
+                if c["up"]:
+                    rate = max(rate, 1.0)    # no more data coming: play out at least in real time
+                c["tau"] = min(k[-1][0], c["tau"] + rate * (now - c["last"]))
+                c["last"] = now
+            if c["up"] and c["tau"] >= k[-1][0]:
+                self._lift(ev, o, c, fresh)
+                del self.contacts[o]
+            else:
+                self._show_move(ev, o, *self._pos(c, c["tau"]))
+        return self._finish(ev)
+
+    def next_tick(self):
+        return time.monotonic() + self.TICK if self.contacts else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--match", default="Raydium", help="substring of the touchscreen name")
+    ap.add_argument("--gap", type=float, default=200, help="max dropout to bridge, ms (default 200)")
+    ap.add_argument("--dist", type=float, default=60, help="max jump across a dropout, device units (default 60)")
+    ap.add_argument("--smooth", type=float, default=50, help="target playback lag used to smooth over freezes, ms; 0 = off (default 50)")
+    ap.add_argument("--verbose", action="store_true", help="print every bridged/split dropout and stroke freeze")
+    a = ap.parse_args()
+
+    devs = [evdev.InputDevice(p) for p in evdev.list_devices()]
+    dev = next((d for d in devs if a.match in d.name and e.INPUT_PROP_DIRECT in d.input_props()
+                and not d.name.endswith("(gap bridge)")), None)
+    if dev is None:
+        sys.exit(f"no touchscreen matching {a.match!r}")
+    caps = dev.capabilities(absinfo=True)
+    caps.pop(e.EV_SYN, None)
+    ui = evdev.UInput(caps, name=f"{dev.name} (gap bridge)", vendor=dev.info.vendor,
+                      product=dev.info.product, version=dev.info.version,
+                      bustype=dev.info.bustype, input_props=dev.input_props())
+    log = (lambda msg: print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)) if a.verbose else None
+    bridge = Bridge(dev.absinfo(e.ABS_MT_SLOT).max + 1, a.gap / 1000, a.dist, log)
+    out = Smooth(a.smooth / 1000) if a.smooth > 0 else Direct()
+    slot, changes, dropped = dev.absinfo(e.ABS_MT_SLOT).value, {}, False
+    dev.grab()
+    print(f"bridging {dev.path} ({dev.name}) -> {ui.name!r}, gap {a.gap:g} ms, "
+          f"dist {a.dist:g}, smooth {a.smooth:g} ms", flush=True)
+
+    def emit(events):
+        for t, c, v in events:
+            ui.write(t, c, v)
+        if events and events[-1][0] != e.EV_SYN:
+            ui.syn()
+
+    try:
+        while True:
+            wake = [t for t in (bridge.deadline(), out.next_tick()) if t is not None]
+            timeout = max(0.0, min(wake) - time.monotonic()) if wake else None
+            if not select.select([dev.fd], [], [], timeout)[0]:
+                now = time.monotonic()
+                emit(out.update(bridge.expire(now), now))
+                continue
+            for ev in dev.read():
+                if ev.type == e.EV_SYN:
+                    if ev.code == e.SYN_DROPPED:
+                        dropped, changes = True, {}
+                    elif ev.code == e.SYN_REPORT:
+                        if not dropped:
+                            now = time.monotonic()
+                            emit(out.update(bridge.frame(changes, now), now))
+                        dropped, changes = False, {}
+                elif ev.type == e.EV_ABS and not dropped:
+                    if ev.code == e.ABS_MT_SLOT:
+                        slot = ev.value
+                    elif ev.code == e.ABS_MT_TRACKING_ID:
+                        changes.setdefault(slot, {})["tid"] = ev.value
+                    elif ev.code == e.ABS_MT_POSITION_X:
+                        changes.setdefault(slot, {})["x"] = ev.value
+                    elif ev.code == e.ABS_MT_POSITION_Y:
+                        changes.setdefault(slot, {})["y"] = ev.value
+    except OSError as err:  # device vanished (suspend, unplug); systemd restarts us
+        sys.exit(f"input device lost: {err}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ui.close()
+
+
+if __name__ == "__main__":
+    main()

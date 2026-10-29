@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pen test</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #16181d; touch-action: none;
+               user-select: none; -webkit-user-select: none; font: 15px/1.45 system-ui, sans-serif; color: #e8ecf4; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; touch-action: none; }
+  #hud { position: fixed; top: 12px; left: 12px; padding: 10px 14px; border-radius: 10px;
+         background: rgba(22, 24, 29, .82); border: 1px solid #333a46; pointer-events: none; max-width: 560px; }
+  #hud b { font-size: 17px; }
+  #stats { margin: 6px 0; font-variant-numeric: tabular-nums; }
+  .key { display: inline-block; width: 22px; height: 4px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  #buttons { margin-top: 8px; pointer-events: auto; }
+  button { font: inherit; color: inherit; background: #262b35; border: 1px solid #3b4352; border-radius: 7px;
+           padding: 5px 12px; margin-right: 6px; touch-action: manipulation; }
+  .ok { color: #00e08a; } .bad { color: #ff5c6c; } .warn { color: #ffb347; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>Pen test</b> &mdash; draw slowly, then fast; write some words.
+  <div id="stats"></div>
+  <div><span class="key" style="background:#ff5c6c"></span><b class="bad">Break</b>: the pen was lost and the line split
+    (the colour changes, a red dashed link shows the gap).</div>
+  <div><span class="key" style="background:#ffb347"></span><b class="warn">Hitch</b>: the line stayed joined but froze, then jumped.</div>
+  <div id="buttons">
+    <button id="clear">Clear (C)</button><button id="dots">Dots (D)</button><button id="full">Fullscreen (F)</button>
+  </div>
+</div>
+<script>
+"use strict";
+const BREAK_MS = 300, BREAK_PX = 100;   // a new touch this soon and this close to a lift = the pen was lost
+const HITCH_MS = 30,  HITCH_PX = 6;     // no update for this long, then a jump this big = frozen line
+const PALETTE = ["#4fc3f7", "#81c784", "#ce93d8", "#fff176", "#4dd0e1", "#f48fb1", "#e0e0e0"];
+const RED = "#ff5c6c", AMBER = "#ffb347";
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const live = new Map();                 // pointerId -> {x, y, t, color}
+let lastUp = null, colorIdx = 0, showDots = false;
+let strokes, breaks, hitches, intervals;
+
+// When served over http (pen-log server), every sample is posted to /log for offline analysis.
+const LOGGING = location.protocol.startsWith("http");
+let logbuf = [];
+const log = (...entry) => { if (LOGGING) logbuf.push(entry); };
+if (LOGGING) setInterval(() => {
+  if (!logbuf.length) return;
+  const batch = logbuf; logbuf = [];
+  fetch("/log", { method: "POST", body: JSON.stringify(batch), keepalive: true }).catch(() => {});
+}, 500);
+
+let dpr0 = 1;                           // pixel ratio the canvas bitmap was made with
+function size() {
+  const dpr = devicePixelRatio || 1;
+  const old = cv.width ? Object.assign(document.createElement("canvas"), { width: cv.width, height: cv.height }) : null;
+  if (old) old.getContext("2d").drawImage(cv, 0, 0);
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = ctx.lineJoin = "round";
+  if (old) ctx.drawImage(old, 0, 0, old.width / dpr0, old.height / dpr0);   // keep the drawing in place
+  dpr0 = dpr;
+}
+
+function reset() {
+  size();
+  ctx.clearRect(0, 0, innerWidth, innerHeight);
+  live.clear(); lastUp = null; strokes = 0; breaks = []; hitches = []; intervals = [];
+  log("clear", 0, performance.now(), 0, 0);
+  stats();
+}
+
+const median = a => a.length ? [...a].sort((p, q) => p - q)[a.length >> 1] : 0;
+
+function stats() {
+  const hz = intervals.length ? Math.round(1000 / median(intervals)) : "–";
+  const b = breaks.length, h = hitches.length;
+  document.getElementById("stats").innerHTML =
+    `Strokes <b>${strokes}</b> &nbsp;·&nbsp; ` +
+    `<span class="${b ? "bad" : "ok"}">Breaks <b>${b}</b>${b ? ` (typ. ${Math.round(median(breaks))} ms)` : ""}</span> &nbsp;·&nbsp; ` +
+    `<span class="${h ? "warn" : "ok"}">Hitches <b>${h}</b>${h ? ` (typ. ${Math.round(median(hitches))} ms)` : ""}</span> &nbsp;·&nbsp; ` +
+    `Updates ~${hz}/s`;
+}
+
+function label(text, x, y, color) {
+  ctx.font = "bold 12px system-ui, sans-serif";
+  const w = ctx.measureText(text).width + 8;
+  ctx.fillStyle = "rgba(22,24,29,.85)"; ctx.fillRect(x + 8, y - 22, w, 17);
+  ctx.fillStyle = color; ctx.fillText(text, x + 12, y - 9);
+}
+
+function ring(x, y, color) {
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(x, y, 7, 0, Math.PI * 2); ctx.stroke();
+}
+
+function segment(a, b, color, width, dash = []) {
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function dot(p, color) {
+  if (!showDots) return;
+  ctx.fillStyle = color; ctx.beginPath(); ctx.arc(p.x, p.y, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#16181d"; ctx.beginPath(); ctx.arc(p.x, p.y, 0.8, 0, Math.PI * 2); ctx.fill();
+}
+
+cv.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  const p = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+  log("down", e.pointerId, p.t, p.x, p.y);
+  if (lastUp) {
+    const gap = p.t - lastUp.t, d = Math.hypot(p.x - lastUp.x, p.y - lastUp.y);
+    if (gap < BREAK_MS && d < BREAK_PX) {
+      breaks.push(gap);
+      segment(lastUp, p, RED, 2, [4, 4]);
+      ring(lastUp.x, lastUp.y, RED); ring(p.x, p.y, RED);
+      label(`break ${Math.round(gap)} ms`, p.x, p.y, RED);
+    }
+  }
+  p.color = PALETTE[colorIdx++ % PALETTE.length];
+  p.x0 = p.x; p.y0 = p.y;   // browsers hold back ~15 px of a fresh touch (tap-vs-drag slop): no hitches there
+  live.set(e.pointerId, p);
+  strokes++;
+  ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, 1.6, 0, Math.PI * 2); ctx.fill();
+  dot(p, p.color);
+  stats();
+});
+
+cv.addEventListener("pointermove", e => {
+  const s = live.get(e.pointerId);
+  if (!s) return;
+  const samples = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  for (const ev of samples.length ? samples : [e]) {
+    const p = { x: ev.clientX, y: ev.clientY, t: ev.timeStamp };
+    log("move", e.pointerId, p.t, p.x, p.y);
+    const dt = p.t - s.t, d = Math.hypot(p.x - s.x, p.y - s.y);
+    if (d === 0) continue;
+    const settled = Math.hypot(p.x - s.x0, p.y - s.y0) > 20;
+    if (dt > HITCH_MS && d > HITCH_PX && settled) {
+      hitches.push(dt);
+      segment(s, p, AMBER, 5);
+      label(`${Math.round(dt)} ms`, p.x, p.y, AMBER);
+    } else {
+      if (dt > 0 && settled) intervals.push(dt);
+      segment(s, p, s.color, 3);
+    }
+    dot(p, s.color);
+    s.x = p.x; s.y = p.y; s.t = p.t;
+  }
+  stats();
+});
+
+function up(e) {
+  const s = live.get(e.pointerId);
+  if (!s) return;
+  live.delete(e.pointerId);
+  log("up", e.pointerId, e.timeStamp, s.x, s.y);
+  lastUp = { x: s.x, y: s.y, t: e.timeStamp };
+}
+cv.addEventListener("pointerup", up);
+cv.addEventListener("pointercancel", up);
+addEventListener("contextmenu", e => e.preventDefault());
+
+function toggleDots() { showDots = !showDots; document.getElementById("dots").textContent = `Dots ${showDots ? "on" : "off"} (D)`; }
+function fullscreen() { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen(); }
+document.getElementById("clear").onclick = reset;
+document.getElementById("dots").onclick = toggleDots;
+document.getElementById("full").onclick = fullscreen;
+addEventListener("keydown", e => {
+  if (e.key === "c" || e.key === "C") reset();
+  else if (e.key === "d" || e.key === "D") toggleDots();
+  else if (e.key === "f" || e.key === "F") fullscreen();
+});
+addEventListener("resize", size);
+reset();
+toggleDots(); toggleDots();   // sync button label
+</script>
+</body>
+</html>

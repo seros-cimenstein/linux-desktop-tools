@@ -1,0 +1,14 @@
+[Unit]
+Description=Bridge stylus dropouts and smooth freezes on the Raydium touchscreen
+
+[Service]
+ExecStart=/usr/local/bin/touch-gap-bridge --gap 200 --dist 60 --smooth 50
+Restart=always
+RestartSec=2
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
