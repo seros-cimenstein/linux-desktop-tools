@@ -4,7 +4,7 @@ Caps CPU frequency (and on Intel, package power) so the laptop runs cool enough 
 
 ```
 quietmode on            # this machine
-quietmode on laptop       # another machine over ssh
+quietmode on laptop     # another machine over ssh
 quietmode on all        # this machine + PEERS from /etc/quietmode.conf
 quietmode off [...]     # restore previous limits
 quietmode status [...]  # caps, temperature, fan RPM
@@ -25,7 +25,7 @@ Per-host settings are in `conf/<hostname>.conf`.
 
 ```
 ./install.sh            # this machine (asks for sudo password once)
-./deploy.sh laptop        # copies the repo to laptop:~/quietmode and installs there
+./deploy.sh laptop      # copies the repo to laptop:~/quietmode and installs there
 ./install.sh uninstall  # or: ./deploy.sh laptop uninstall
 ```
 
